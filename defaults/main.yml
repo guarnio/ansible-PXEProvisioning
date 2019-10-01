@@ -1,0 +1,10 @@
+---
+# defaults file for ansible-PXEProvisioning
+ram: 2048
+disks:
+  - size: 24
+    pool: default
+os_type: linux
+# to get a list of supported vaules for os_variant run "osinfo-query os"
+os_variant: rhel7
+net: default

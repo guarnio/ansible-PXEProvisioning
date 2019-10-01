@@ -1,0 +1,172 @@
+---
+# tasks file for ansible-PXEProvisioning
+
+#- name: get domain of the requested machine
+#  set_fact:
+#    requested_domain: "{{ variable_host.split('.')[-2] + '.' + variable_host.split('.')[-1] }}"
+
+- name: configure inventory_hostname variable
+  set_fact:
+    variable_host: "{{ inventory_hostname }}"
+
+- name: get domain of the requested machine
+  set_fact:
+    requested_domain: "{{ variable_host | regex_replace( variable_host.split('.')[0]+'.', '')  }}"
+
+- name: get related managed domain
+  set_fact:
+    configured_domain: "{{ item }}"
+  with_items: "{{managed_domains}}"
+  when: item.dns_domain == requested_domain
+
+- name: set kickstart root directory
+  set_fact:
+    kickstart_root: "{{ '/var/www/html/rhel/' + release.split('-')[-1] }}"
+
+- name: check if the vm already exists
+  shell: "[ $(virsh list --all| grep -c {{variable_host}}) -gt 0 ] && { echo True; } || { echo False; }"
+  register: vm_exists
+  delegate_to: "{{hipervisor}}"
+  become: true
+
+- name: add new host entry to DNS server
+  lineinfile:
+    path: "{{bind_fw}}"
+    line: "{{variable_host.split('.')[0]}}		IN	A	{{ip}}"
+  register: restartnamed_1
+  delegate_to: "{{dns}}"
+  become: true
+
+- name: add new reverse host entry to DNS server
+  lineinfile:
+    path: "{{bind_rev}}"
+    line: "{{ip.split('.')[-1]}}  IN  PTR   {{variable_host}}."
+  register: restartnamed_2
+  delegate_to: "{{dns}}"
+  become: true
+
+- name: restart DNS server
+  service:
+    name: named
+    state: restarted
+  delegate_to: "{{dns}}"
+  when: ((restartnamed_1 is defined) and (restartnamed_1.changed)) or ((restartnamed_2 is defined) and (restartnamed_2.changed))
+  become: true
+
+- block:
+
+      - name: remove entry from knownhosts file
+        lineinfile:
+          path: "/home/mguarnieri/.ssh/known_hosts"
+          regexp: "^{{variable_host}}.*"
+          state: absent
+        delegate_to: "{{hipervisor}}"
+        become: true
+
+      - name: deploy ks templates
+        template:
+          src: "ks/install_bios.ks.j2"
+          dest: "{{kickstart_root}}/install.ks"
+        delegate_to: "{{hipervisor}}"
+        become: true
+
+      - name: deploy VM
+        shell: "virt-install --name {{variable_host}} -r {{ram}} {% for each in disks %}--disk size={{each.size}},pool={{each.pool}}{%endfor%} --os-type={{os_type}} --os-variant={{os_variant}} --network network={{requested_domain}} --pxe --print-xml"
+        # --nographics --noautoconsole
+        register: deployedvm
+        delegate_to: "{{hipervisor}}"
+        become: true
+
+      #- shell: "virsh vol-delete /var/lib/libvirt/images/{{variable_host}}.qcow2"
+      #  delegate_to: "{{hipervisor}}"
+
+      - name: store VM build files
+        set_fact:
+          vm: "{{ deployedvm.stdout_lines|xml_parsing }}"
+
+      - name: grab mac-address
+        set_fact:
+          macaddress: "{{ vm['domains1'] | join | regex_search('mac address.*') | regex_replace('.*address\\=\"(.................).*$','\\1') }}"
+
+      - copy:
+          dest: "/tmp/step1.xml"
+          content: "{% for line in  vm['domains1'] %}{{line}}{%endfor%}"
+        delegate_to: "{{hipervisor}}"
+
+      - copy:
+          dest: "/tmp/step2.xml"
+          content: "{% for line in  vm['domains2'] %}{{line}}{%endfor%}"
+        delegate_to: "{{hipervisor}}"
+
+      - name: deploy pxe template
+        template:
+            dest: "{{tftp_folder}}/01-{{ macaddress|replace(':','-') }}"
+            src: pxe-config.j2
+        delegate_to: "{{hipervisor}}"
+        become: true
+
+      - name: start VM
+        shell: "virsh create /tmp/step1.xml"
+        delegate_to: "{{hipervisor}}"
+        become: true
+
+      - name: check if vm deployment is terminated (could take more than 10 minutes)
+        shell: "virsh list --all | grep -c {{variable_host}}"
+        register: vm_off
+        until: vm_off.stdout.find("0") != -1
+        delegate_to: "{{hipervisor}}"
+        retries: 10
+        delay: 60
+        failed_when: false
+        become: true
+
+      - name: remove pxe template
+        file:
+          path: "{{tftp_folder}}/01-{{ macaddress|replace(':','-') }}"
+          state: absent
+        delegate_to: "{{hipervisor}}"
+        become: true
+
+      - name: define VM
+        shell: "virsh define /tmp/step2.xml"
+        delegate_to: "{{hipervisor}}"
+        become: true
+
+  when: vm_exists.stdout == "False"
+
+- name: check if the is started already
+  shell: "[ $(virsh list| grep -c {{variable_host}}) -gt 0 ] && { echo True; } || { echo False; }"
+  register: vm_started
+  delegate_to: "{{hipervisor}}"
+  become: true
+
+- name: start the new vm
+  shell: "virsh start {{variable_host}}"
+  delegate_to: "{{hipervisor}}"
+  become: true
+  when: vm_started.stdout == "False"
+
+- name: remove templates
+  file:
+    path: "{{item}}"
+    state: absent
+  delegate_to: "{{hipervisor}}"
+  become: true
+  with_items:
+    - "/tmp/step1.xml"
+    - "/tmp/step2.xml"
+
+- name: add entry to local hosts file
+  lineinfile:
+    path: "/etc/hosts"
+    line: "{{ip}}\t{{variable_host}}"
+  delegate_to: "{{hipervisor}}"
+  become: true
+
+- name: wait untile the VM is accessible
+  ignore_errors: True
+  local_action: wait_for port=22 host="{{variable_host}}" search_regex=OpenSSH delay=0 timeout=1800
+
+- name: wait for one minute
+  pause:
+    minutes: 1

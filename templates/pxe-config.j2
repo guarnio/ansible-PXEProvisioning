@@ -1,0 +1,10 @@
+timeout 50
+
+display boot.msg
+default menu.c32
+
+label rhel7
+  menu label {{variable_host}} pxe deployment
+  kernel images/{{release}}/vmlinuz
+  menu default
+  append initrd=images/{{release}}/initrd.img ip={{ip}}::{{configured_domain.gateway}}:{{configured_domain.netmask}}:{{variable_host}}:eth0:none nameserver={{configured_domain.dns}} inst.repo=http://{{configured_domain.gateway}}/rhel/{{release.split('-')[-1]}}/server/x86_64/os/ modprobe.blacklist=usb_storage net.ifnames=0 biosdevname=0 inst.ks=http://{{configured_domain.gateway}}/rhel/{{release.split('-')[-1]}}/install.ks console=tty0 console=ttyS0,115200 
